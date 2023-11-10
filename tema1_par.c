@@ -1,4 +1,4 @@
-#define _XOPEN_SOURCE 700
+#define _XOPEN_SOURCE 600
 
 #include "helpers.h"
 #include <stdio.h>
@@ -22,7 +22,7 @@ typedef struct {
     int p, q, step_x, step_y, thread_id, num_threads;
     unsigned char **grid;
     ppm_image **contour_map;
-    pthread_barrier_t barrier;
+    pthread_barrier_t* barrier;
 } thread_data;
 
 // Creates a map between the binary configuration (e.g. 0110_2) and the corresponding pixels
@@ -59,27 +59,28 @@ void update_image(ppm_image *image, ppm_image *contour, int x, int y) {
     }
 }
 
-// Calls `free` method on the utilized resources.
-void free_resources(ppm_image *image, ppm_image **contour_map, unsigned char **grid, int step_x) {
+void free_resources(ppm_image *image, ppm_image *scaled_image, unsigned char **grid, ppm_image **contour_map, int p, thread_data *data) {
+    free(image->data);
+    free(image);
+    free(scaled_image->data);
+    free(scaled_image);
+    for (int i = 0; i <= p; i++) {
+        free(grid[i]);
+    }
+    free(grid);
     for (int i = 0; i < CONTOUR_CONFIG_COUNT; i++) {
         free(contour_map[i]->data);
         free(contour_map[i]);
     }
     free(contour_map);
-
-    for (int i = 0; i <= image->x / step_x; i++) {
-        free(grid[i]);
-    }
-    free(grid);
-
-    free(image->data);
-    free(image);
+    free(data);
 }
 
 
 void *thread_function(void *arg) {
 
     // rescale image
+
     uint8_t sample[3];
 
     if (arg == NULL) {
@@ -91,11 +92,12 @@ void *thread_function(void *arg) {
 
     if (data->image->x <= RESCALE_X && data->image->y <= RESCALE_Y) {
         data->scaled_image = data->image;
-    } else {
+    } 
+    else {
         data->scaled_image->x = RESCALE_X;
         data->scaled_image->y = RESCALE_Y;
         int start = data->thread_id * data->scaled_image->x / data->num_threads;
-        int end = fmin((data->thread_id + 1) * data->scaled_image->x / data->num_threads, data->scaled_image->x);
+        int end = fmin((data->thread_id + 1) * (double)(data->scaled_image->x) / data->num_threads, data->scaled_image->x);
 
         for (int i = start; i < end; i++) {
             for (int j = 0; j < data->scaled_image->y; j++) {
@@ -109,17 +111,13 @@ void *thread_function(void *arg) {
             }
         }
         
-        // pthread_barrier_wait(&(data->barrier));
-        // printf("adresa2: %p\n", &data->barrier);
-
-        // free(data->image->data);
-        // free(data->image);
+        pthread_barrier_wait(data->barrier);
     }
-    // pthread_barrier_wait(&(data->barrier));
-    // printf("adresa2: %p\n", &data->barrier);
 
     // sample grid
 
+    data->p = data->scaled_image->x / data->step_x;
+    data->q = data->scaled_image->y / data->step_y;
     int start = data->thread_id * (double) data->p / data->num_threads;
     int end = fmin((data->thread_id + 1) * (double) data->p / data->num_threads, data->p);
 
@@ -137,10 +135,7 @@ void *thread_function(void *arg) {
                 
     }
     data->grid[data->p][data->q] = 0;
-    // pthread_barrier_wait(&data->barrier);
-
-    // last sample points have no neighbors below / to the right, so we use pixels on the
-    // last row / column of the input image for them
+    pthread_barrier_wait(data->barrier);
 
     for (int i = 0; i < data->p; i++) {
         ppm_pixel curr_pixel = data->scaled_image->data[i * data->step_x * data->scaled_image->y + data->scaled_image->x - 1];
@@ -181,6 +176,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // read image
     ppm_image *image = read_ppm(argv[1]);
     int step_x = STEP;
     int step_y = STEP;
@@ -192,19 +188,17 @@ int main(int argc, char *argv[]) {
     int num_threads = atoi(argv[3]);
     pthread_t threads[num_threads];
 
-    // allocate memory
+    // allocate memory for thread data
     thread_data *data = (thread_data *)malloc(num_threads * sizeof(thread_data));
     if (data == NULL) {
         fprintf(stderr, "Unable to allocate memory\n");
         exit(1);
     }
-    ppm_image *scaled_image = malloc(sizeof(ppm_image));
+    ppm_image *scaled_image =(ppm_image *) malloc(sizeof(ppm_image));
     if (scaled_image == NULL) {
         fprintf(stderr, "Unable to allocate memory\n");
         exit(1);
     }
-    scaled_image->x = RESCALE_X;
-    scaled_image->y = RESCALE_Y;
     scaled_image->data = (ppm_pixel*)malloc(RESCALE_X * RESCALE_Y * sizeof(ppm_pixel));
     unsigned char **grid = (unsigned char **)malloc((p + 1) * sizeof(unsigned char*));
     if (grid == NULL) {
@@ -222,7 +216,6 @@ int main(int argc, char *argv[]) {
     ppm_image **contour_map = init_contour_map();
     pthread_barrier_t barrier;
     pthread_barrier_init(&barrier, NULL, num_threads);
-    printf("adresa1: %p\n", &barrier);
 
 
     for (i = 0; i < num_threads; i++) {
@@ -236,7 +229,7 @@ int main(int argc, char *argv[]) {
         data[i].step_y = step_y;
         data[i].thread_id = i;
         data[i].num_threads = num_threads;
-        data[i].barrier = barrier;
+        data[i].barrier = &barrier;
 
         r = pthread_create(&threads[i], NULL, thread_function, (void *)&data[i]);
         if (r) {
@@ -253,13 +246,9 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // 4. Write output
-    //write_ppm(scaled_image, argv[2]);
     write_ppm(data[0].scaled_image, argv[2]);
 
-    // free(data);
-
-    // free_resources(scaled_image, contour_map, grid, step_x);
+    free_resources(image, scaled_image, grid, contour_map, p, data);
 
     return 0;
 }
